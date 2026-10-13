@@ -24,6 +24,7 @@
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include <cstring>
+#include <stdlib.h>
 #endif
 
 using namespace facebook;
@@ -559,6 +560,50 @@ namespace rnllama_jsi {
                 if (!params.is_object()) {
                     throw jsi::JSError(runtime, "llamaInitContext: params must be an object");
                 }
+#if defined(__ANDROID__)
+                // OpenCL tuning channel: JS may pass "_oclEnv" as KEY=VALUE lines
+                // separated by newlines. Only GGML_OPENCL_* keys with values under 128
+                // chars are set, and all of them before the context is created - the
+                // OpenCL backend reads the environment in ggml_cl_init and in the lazy
+                // kernel build, and caches part of it in function statics.
+                // Each line is echoed: without the echo, "the knob is on" and "the knob
+                // never made it" are indistinguishable on a device.
+                {
+                    const std::string oclEnv = getPropertyAsString(params, "_oclEnv", "");
+                    size_t oclEnvFrom = 0;
+                    while (oclEnvFrom < oclEnv.size()) {
+                        size_t oclEnvEnd = oclEnv.find('\n', oclEnvFrom);
+                        if (oclEnvEnd == std::string::npos) {
+                            oclEnvEnd = oclEnv.size();
+                        }
+                        std::string oclEnvLine = oclEnv.substr(oclEnvFrom, oclEnvEnd - oclEnvFrom);
+                        oclEnvFrom = oclEnvEnd + 1;
+                        if (!oclEnvLine.empty() && oclEnvLine.back() == '\r') {
+                            oclEnvLine.pop_back();
+                        }
+                        if (oclEnvLine.empty()) {
+                            continue;
+                        }
+                        const size_t oclEnvEq = oclEnvLine.find('=');
+                        if (oclEnvEq == std::string::npos) {
+                            logInfo("llama.rn: _oclEnv line skipped, no '=': %s\n", oclEnvLine.c_str());
+                            continue;
+                        }
+                        const std::string oclEnvKey = oclEnvLine.substr(0, oclEnvEq);
+                        const std::string oclEnvVal = oclEnvLine.substr(oclEnvEq + 1);
+                        if (oclEnvKey.rfind("GGML_OPENCL_", 0) != 0) {
+                            logInfo("llama.rn: _oclEnv key skipped, not GGML_OPENCL_*: %s\n", oclEnvKey.c_str());
+                            continue;
+                        }
+                        if (oclEnvVal.size() > 128) {
+                            logInfo("llama.rn: _oclEnv value skipped, longer than 128 chars: %s\n", oclEnvKey.c_str());
+                            continue;
+                        }
+                        setenv(oclEnvKey.c_str(), oclEnvVal.c_str(), 1);
+                        logInfo("llama.rn: _oclEnv %s=%s\n", oclEnvKey.c_str(), oclEnvVal.c_str());
+                    }
+                }
+#endif
                 bool isModelAsset = getPropertyAsBool(params, "is_model_asset", false);
                 bool isModelDraftAsset = getPropertyAsBool(params, "is_model_draft_asset", false);
 
