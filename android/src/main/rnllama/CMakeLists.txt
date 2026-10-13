@@ -65,7 +65,7 @@ function(build_rnllama_library target_name arch cpu_flags)
     # ThinLTO rather than monolithic LTO: linking is parallel and incremental, and
     # peak memory stays low enough that several variants can link concurrently
     # (full LTO here OOM-killed 16 GB CI runners).
-    target_compile_options(${target_name} PRIVATE -DGGML_USE_CPU -DGGML_USE_CPU_REPACK -pthread ${cpu_flags} -fvectorize -ffp-model=fast -fno-finite-math-only -flto=thin -D_GNU_SOURCE)
+    target_compile_options(${target_name} PRIVATE -DGGML_USE_CPU -DGGML_USE_CPU_REPACK -DGGML_USE_RPC -pthread ${cpu_flags} -fvectorize -ffp-model=fast -fno-finite-math-only -flto=thin -D_GNU_SOURCE)
 
     if (CMAKE_BUILD_TYPE AND CMAKE_BUILD_TYPE STREQUAL "Debug")
         target_compile_options(${target_name} PRIVATE -DRNLLAMA_ANDROID_ENABLE_LOGGING)

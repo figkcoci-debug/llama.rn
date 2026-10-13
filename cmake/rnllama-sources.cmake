@@ -58,6 +58,10 @@ set(RNLLAMA_GGML_SOURCES
     ${_ggml}/ggml-backend-dl.cpp
     ${_ggml}/ggml-backend-meta.cpp
     ${_ggml}/ggml-backend-reg.cpp
+    # The RPC backend (client and server); ggml-backend-reg.cpp registers it
+    # under GGML_USE_RPC, which every llama.rn build defines (see the callers).
+    ${_ggml}/ggml-rpc/ggml-rpc.cpp
+    ${_ggml}/ggml-rpc/transport.cpp
     ${_ggml}/ggml-opt.cpp
     ${_ggml}/ggml-threading.cpp
     ${_ggml}/ggml-quants.c

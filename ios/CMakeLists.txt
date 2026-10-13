@@ -17,6 +17,7 @@ add_definitions(
     -DGGML_USE_BLAS
     -DGGML_BLAS_USE_ACCELERATE
     -DGGML_USE_METAL
+    -DGGML_USE_RPC
     -DGGML_METAL_EMBED_LIBRARY=1
     # ggml-metal only defines its bundle-lookup Objective-C class when the
     # Metal library is not embedded. Objective-C class names are process-global,

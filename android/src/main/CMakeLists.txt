@@ -112,7 +112,7 @@ function(build_rnllama_jni jni_name rnllama_name arch cpu_flags)
         target_link_libraries(${jni_name} PRIVATE ${PREBUILT_LIB_PATH})
     endif()
 
-    target_compile_options(${jni_name} PRIVATE -pthread ${cpu_flags})
+    target_compile_options(${jni_name} PRIVATE -DGGML_USE_RPC -pthread ${cpu_flags})
 
     # Special handling for OpenCL variant when building from source
     if (RNLLAMA_BUILD_FROM_SOURCE AND ENABLE_OPENCL)

@@ -2,7 +2,7 @@ require "json"
 
 package = JSON.parse(File.read(File.join(__dir__, "package.json")))
 base_ld_flags = "-framework Accelerate -framework Foundation -framework Metal -framework MetalKit"
-base_compiler_flags = "-fno-objc-arc -fvisibility-inlines-hidden -DGGML_USE_CPU -DGGML_USE_ACCELERATE -DGGML_USE_BLAS -DGGML_BLAS_USE_ACCELERATE -DGGML_USE_CPU_REPACK -Wno-shorten-64-to-32"
+base_compiler_flags = "-fno-objc-arc -fvisibility-inlines-hidden -DGGML_USE_CPU -DGGML_USE_ACCELERATE -DGGML_USE_BLAS -DGGML_BLAS_USE_ACCELERATE -DGGML_USE_CPU_REPACK -DGGML_USE_RPC -Wno-shorten-64-to-32"
 
 if ENV["RNLLAMA_DISABLE_METAL"] != "1" then
   # GGMLMetalClass only exists when GGML_METAL_EMBED_LIBRARY is off; keep the
@@ -46,6 +46,7 @@ Pod::Spec.new do |s|
       "#{llama_cpp}/ggml/src/ggml-cpu/**/*.{h,c,cpp}",
       "#{llama_cpp}/ggml/src/ggml-metal/*.{h,m,cpp,s}",
       "#{llama_cpp}/ggml/src/ggml-blas/*.{h,cpp}",
+      "#{llama_cpp}/ggml/src/ggml-rpc/*.{h,cpp}",
       "#{llama_cpp}/common/**/*.{h,cpp}",
       "#{llama_cpp}/tools/mtmd/**/*.{h,cpp}",
       "#{llama_cpp}/vendor/**/*.{h,hpp,c,cpp}",
@@ -61,6 +62,7 @@ Pod::Spec.new do |s|
       "#{llama_cpp}/common/{arg,console,debug,download,hf-cache,imatrix-loader,llguidance,preset,subproc}.cpp",
       "#{llama_cpp}/ggml/src/ggml-cpu/hbm.cpp",
       "#{llama_cpp}/ggml/src/ggml-cpu/{kleidiai,llamafile,arch/wasm}/*",
+      "#{llama_cpp}/ggml/src/ggml-rpc/transport-apple.cpp",
       "#{llama_cpp}/vendor/{cpp-httplib,hash/sha1,hash/xxhash}/*",
       "#{llama_cpp}/tools/mtmd/debug/*.cpp", "#{codec_cpp}/common/tts_runner*.cpp",
       "#{llama_cpp}/common/jinja/string.h"
