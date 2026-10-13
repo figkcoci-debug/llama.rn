@@ -102,13 +102,14 @@ LLAMA_CPP_PATHS=(
   ggml/src/ggml-cpu/arch/wasm
   ggml/src/ggml-cpu/arch/x86
 
-  # Backends. llama.rn builds Metal, BLAS, OpenCL and Hexagon; llama.node
+  # Backends. llama.rn builds Metal, BLAS, OpenCL, Hexagon and RPC; llama.node
   # additionally builds CUDA, Vulkan and WebGPU (its WASM package).
   ggml/src/ggml-blas
   ggml/src/ggml-cuda
   ggml/src/ggml-hexagon
   ggml/src/ggml-metal
   ggml/src/ggml-opencl
+  ggml/src/ggml-rpc
   ggml/src/ggml-vulkan
   ggml/src/ggml-webgpu
 
