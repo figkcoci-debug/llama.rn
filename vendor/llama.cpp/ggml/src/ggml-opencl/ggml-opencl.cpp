@@ -346,9 +346,19 @@ static ggml_cl_compiler_version get_adreno_cl_compiler_version(const char *drive
     }
 
     std::string compiler_ver_str = driver_ver_str.substr(compiler_ver_pos, compiler_ver_len);
-    int major = std::atoi(compiler_ver_str.substr(compiler_major_offset, 2).c_str());
-    int minor = std::atoi(compiler_ver_str.substr(compiler_minor_offset, 2).c_str());
-    int patch = std::atoi(compiler_ver_str.substr(compiler_patch_offset, 2).c_str());
+    // substr() throws std::out_of_range when the offset is past the end, and this runs
+    // straight out of ggml_cl_init: a short driver string ("E031.41") would escape
+    // through the C init frames into std::terminate. A missing field reads as -1, i.e.
+    // "older than any threshold": the workarounds turn on rather than off.
+    auto compiler_ver_field = [&compiler_ver_str](size_t offset) -> int {
+        if (offset + 2 > compiler_ver_str.size()) {
+            return -1;
+        }
+        return std::atoi(compiler_ver_str.substr(offset, 2).c_str());
+    };
+    int major = compiler_ver_field(compiler_major_offset);
+    int minor = compiler_ver_field(compiler_minor_offset);
+    int patch = compiler_ver_field(compiler_patch_offset);
     return { type, major, minor, patch };
 }
 
@@ -6638,8 +6648,16 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
 
     const char * str_opfilter = getenv("GGML_OPENCL_OPFILTER");
     if (str_opfilter) {
-        dev_ctx->opfilter_str = str_opfilter;
-        dev_ctx->opfilter = new std::regex(str_opfilter, std::regex_constants::icase);
+        // The pattern is typed by hand, so a bad one must cost the experiment, not the
+        // app: std::regex throws std::regex_error, and the exception would escape this
+        // init path into std::terminate. On rejection the filter is simply not
+        // installed (opfilter stays nullptr) and the backend behaves as stock.
+        try {
+            dev_ctx->opfilter = new std::regex(str_opfilter, std::regex_constants::icase);
+            dev_ctx->opfilter_str = str_opfilter;
+        } catch (const std::regex_error & e) {
+            GGML_LOG_WARN("ggml_opencl: opfilter rejected: %s (%s)\n", str_opfilter, e.what());
+        }
     }
 
     return true;
@@ -8523,6 +8541,34 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
 // The optimized gemm and gemv kernels are used for large matrices without batch.
 // tensor is the quantized weights matrix.
 inline bool use_adreno_kernels(const ggml_backend_opencl_context *backend_ctx, const ggml_tensor *tensor) {
+    // Full off switch for the Adreno kernel family. The thresholds below move with the
+    // compiler revision, so on an old E031 the family is chosen for almost every large
+    // tensor; no other key can take the whole family out, which makes isolating it in a
+    // field test impossible. The weights conversion, the transposed layout and the
+    // dispatch all ask this single function, so a refusal here is consistent by
+    // construction. A value starting with '0' disables the family; read per call.
+    {
+        const char * adreno_kernels_env = getenv("GGML_OPENCL_ADRENO_KERNELS");
+        if (adreno_kernels_env != nullptr && adreno_kernels_env[0] == '0') {
+            return false;
+        }
+    }
+    // Per-type off switches inside the family, same rationale: the weight layout is
+    // chosen once by the converter and by this same function, so a per-type refusal
+    // stays consistent. GGML_OPENCL_Q6K_DENSE_DP4A=0 separately takes out the q6_K
+    // dp4a prefill, splitting the q6_K path into its GEMV and prefill halves.
+    {
+        const char * q40_kernels_env = getenv("GGML_OPENCL_Q40_KERNELS");
+        if (q40_kernels_env != nullptr && q40_kernels_env[0] == '0' &&
+            tensor->type == GGML_TYPE_Q4_0) {
+            return false;
+        }
+        const char * q6k_kernels_env = getenv("GGML_OPENCL_Q6K_KERNELS");
+        if (q6k_kernels_env != nullptr && q6k_kernels_env[0] == '0' &&
+            tensor->type == GGML_TYPE_Q6_K) {
+            return false;
+        }
+    }
     int64_t threshold_ne0 = 512;
     int64_t threshold_ne1 = 512;
     if (!backend_ctx->adreno_cl_compiler_version.newer_than_or_same(E031, 38, 11, 0) &&
@@ -8784,9 +8830,12 @@ static inline bool use_flat_gemv_for_large_m_q6_K(const ggml_backend_opencl_cont
     // proxy for "large weight" that misses a narrow-hidden vocab-scale lm_head.
     // Add a direct size escape so such weights also take the flat path, without changing
     // which weights ne0 >= 2048 already routes there.
-    // The size escape is not taken on the A7X since its compiler miscompiles the flat K-quant GEMV
+    // The size escape is not taken on compilers that miscompile the flat K-quant GEMV:
+    // the A7X generation as before, plus any Adreno on an older E031 compiler.
     return tensor->ne[1] >= 32768
-        && (tensor->ne[0] >= 2048 || (backend_ctx->adreno_gen != ADRENO_GPU_GEN::A7X && ggml_nbytes(tensor) >= (256ull << 20)))
+        && (tensor->ne[0] >= 2048 ||
+            (!(backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
+               backend_ctx->q6_k_flat_old_compiler) && ggml_nbytes(tensor) >= (256ull << 20)))
         && tensor->ne[2] == 1 && tensor->ne[3] == 1;
 }
 
@@ -9072,8 +9121,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                 // for this compiler series.
                 static const char * a7x_lmhead_env = getenv("GGML_OPENCL_A7X_LMHEAD_CPU");
                 static const bool   a7x_lmhead_cpu = (a7x_lmhead_env == nullptr || a7x_lmhead_env[0] != '0');
+                // The compiler, not the generation, is key: an older E031 miscompiles the
+                // same flat kernel on any Adreno, including the A6X and the models the
+                // generation table does not know. The condition only widens.
                 if (a7x_lmhead_cpu &&
-                    backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
+                    (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
+                     backend_ctx->q6_k_flat_old_compiler) &&
                     (op->src[0]->type == GGML_TYPE_Q4_K || op->src[0]->type == GGML_TYPE_Q5_K ||
                      op->src[0]->type == GGML_TYPE_Q6_K) &&
                     op->src[0]->ne[1] >= 32768) {   // vocab-scale weight; no FFN/attn weight is this tall
@@ -9241,7 +9294,11 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             // those (f16-KV / quant-KV) attention layers on the CPU backend.
             // Negative compiler carve-out, same idiom as the Intel DK=512 decline
             // below and the X1E driver-quirk guards.
-            if (backend_ctx && backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
+            // The crash tracks the compiler, not the generation: on an older E031 skip
+            // on any Adreno, not only on the A7X. The condition only widens.
+            if (backend_ctx &&
+                (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
+                 backend_ctx->q6_k_flat_old_compiler) &&
                 (is_f32_f16 || is_f32_q8_0 || is_f32_q4_0)) {
                 return false;
             }
@@ -9263,8 +9320,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 
             // Some compilers for A7x (Adreno 740, compiler E031.41) crashes when
             // building FA kernels with mixed or quant types (f32_f16, f32_q8_0, f32_q4_0)
-            // Here we skip all A7x for these kernels to avoid crash
-            if (backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X &&
+            // The crash tracks the compiler, not the generation: skip on every Adreno
+            // with an older E031 (see the first copy of this gate above).
+            if ((backend_ctx->adreno_gen == ADRENO_GPU_GEN::A7X ||
+                 backend_ctx->q6_k_flat_old_compiler) &&
                 (is_f32_f16 || is_f32_q8_0 || is_f32_q4_0)) {
                 return false;
             }
