@@ -489,6 +489,17 @@ if (!NativeModules.RNLlama) {
       jest.fn(async () => {}),
     )
     setGlobal(
+      'llamaRpcAddServer',
+      jest.fn(async (endpoint) => ({ endpoint, count: 0, devices: [] })),
+    )
+    setGlobal(
+      'llamaRpcStartServer',
+      jest.fn(async (params) => ({
+        endpoint: params?.endpoint ?? '',
+        devices: params?.devices ?? [],
+      })),
+    )
+    setGlobal(
       'llamaClearCache',
       jest.fn(async () => {}),
     )

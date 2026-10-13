@@ -177,6 +177,8 @@ const jsiBindingKeys = [
   'llamaGetParallelStatus',
   'llamaSubscribeParallelStatus',
   'llamaUnsubscribeParallelStatus',
+  'llamaRpcAddServer',
+  'llamaRpcStartServer',
 ] as const
 
 type JsiBindingKey = (typeof jsiBindingKeys)[number]
@@ -1566,6 +1568,42 @@ export async function getBackendDevicesInfo(): Promise<
     )
     return []
   }
+}
+
+export type RpcServerInfo = {
+  endpoint: string
+  count: number
+  devices: string[]
+}
+
+export type RpcStartServerParams = {
+  endpoint: string
+  cacheDir?: string
+  threads?: number
+  devices?: string[]
+}
+
+/**
+ * Connect an already running RPC node as a device of this app (client side).
+ * Resolves with the node's device names after the handshake.
+ */
+export async function rpcAddServer(endpoint: string): Promise<RpcServerInfo> {
+  await installJsi()
+  const { llamaRpcAddServer } = getJsi()
+  return llamaRpcAddServer(endpoint)
+}
+
+/**
+ * Raise an RPC node on this device (server side) over the given backend devices.
+ * The node runs on its own native thread and blocks for its lifetime; a node has
+ * no stop call, so taking it down means restarting the app.
+ */
+export async function rpcStartServer(
+  params: RpcStartServerParams,
+): Promise<{ endpoint: string; devices: string[] }> {
+  await installJsi()
+  const { llamaRpcStartServer } = getJsi()
+  return llamaRpcStartServer(params)
 }
 
 export async function initLlama(

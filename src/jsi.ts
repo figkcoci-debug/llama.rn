@@ -88,6 +88,20 @@ declare global {
     onLog?: (level: string, text: string) => void,
   ) => Promise<void>
   var llamaSetContextLimit: (limit: number) => Promise<void>
+  var llamaRpcAddServer: (endpoint: string) => Promise<{
+    endpoint: string
+    count: number
+    devices: string[]
+  }>
+  var llamaRpcStartServer: (params: {
+    endpoint: string
+    cacheDir?: string
+    threads?: number
+    devices?: string[]
+  }) => Promise<{
+    endpoint: string
+    devices: string[]
+  }>
   var llamaCompletion: (
     contextId: number,
     params: NativeCompletionParams,

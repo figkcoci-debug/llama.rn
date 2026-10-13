@@ -21,6 +21,11 @@
 #include <utility>
 #include <vector>
 
+#if defined(GGML_USE_RPC)
+#include "ggml-rpc.h"
+#include <thread>
+#endif
+
 #if defined(__ANDROID__)
 #include <android/log.h>
 #include <cstring>
@@ -56,6 +61,47 @@ static void log(LogLevel level, const char* format, ...) {
 #define logDebug(format, ...) log(LogLevel::LOG_DEBUG, format, ##__VA_ARGS__)
 
 static std::once_flag backend_init_once;
+
+#if defined(GGML_USE_RPC)
+namespace {
+
+// The RPC node's start_server blocks inside accept() for its whole life, so it runs on
+// its own thread rather than on the task pool: a single node would otherwise occupy a
+// worker forever. The endpoint and cache strings are handed to start_server as pointers
+// and must outlive the call, so they sit next to the thread, not in a lambda capture.
+std::thread       g_rpc_server_thread;
+std::mutex        g_rpc_server_mutex;
+std::string       g_rpc_server_endpoint;
+std::string       g_rpc_server_cache_dir;
+std::atomic<bool> g_rpc_server_running{false};
+
+// llama_backend_init() registers the statically built backends (it guards
+// ggml_backend_load_all() by itself). RPC only reaches the registry when the library
+// was built with GGML_USE_RPC, so ask the registry instead of trusting the build.
+void rpcCheckRpcBackend() {
+    llama_backend_init();
+    if (ggml_backend_reg_by_name("RPC") == nullptr) {
+        throw std::runtime_error("rpc: backend not registered - the library was built without GGML_USE_RPC");
+    }
+}
+
+// Device names -> devices. Nothing is filtered here on purpose: a name the registry
+// does not know is reported as "not found" rather than dropped silently.
+std::vector<ggml_backend_dev_t> rpcResolveDevices(const std::vector<std::string> & names) {
+    std::vector<ggml_backend_dev_t> out;
+    for (const auto & name : names) {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_name(name.c_str());
+        if (dev == nullptr) {
+            logInfo("rpc: device %s is not in the registry, skipped\n", name.c_str());
+            continue;
+        }
+        out.push_back(dev);
+    }
+    return out;
+}
+
+} // namespace
+#endif
 
 #if defined(__ANDROID__)
 static bool shouldExcludeHexagonDevice(ggml_backend_dev_t dev) {
@@ -1862,6 +1908,151 @@ namespace rnllama_jsi {
             }
         );
         runtime.global().setProperty(runtime, "llamaSetContextLimit", setContextLimitFn);
+
+        // RPC: connect a node as a device (client side). The handshake happens inside
+        // add_server, which blocks, so this runs on the task pool. The promise resolves
+        // with the node's device names.
+        auto rpcAddServerFn = jsi::Function::createFromHostFunction(runtime,
+            jsi::PropNameID::forAscii(runtime, "llamaRpcAddServer"),
+            1,
+            [callInvoker](jsi::Runtime& runtime, const jsi::Value& thisValue, const jsi::Value* arguments, size_t count) -> jsi::Value {
+                const std::string endpoint = (count > 0 && arguments[0].isString())
+                    ? arguments[0].asString(runtime).utf8(runtime)
+                    : std::string();
+                return createPromiseTask(runtime, callInvoker, [endpoint]() -> PromiseResultGenerator {
+#if defined(GGML_USE_RPC)
+                    if (endpoint.empty()) {
+                        throw std::runtime_error("rpc: no endpoint given");
+                    }
+                    rpcCheckRpcBackend();
+
+                    ggml_backend_reg_t reg = ggml_backend_rpc_add_server(endpoint.c_str());
+                    if (reg == nullptr) {
+                        throw std::runtime_error(std::string("rpc: node ") + endpoint +
+                            " answered with no devices (address, port, peer?)");
+                    }
+                    // Without this line RPC0 never reaches the global device list:
+                    // add_server fills its own registry, while ggml_backend_dev_count()
+                    // reads the singleton that register_backend() fills. The failure
+                    // would be silent - the screen says "cluster" and one phone computes.
+                    ggml_backend_register(reg);
+
+                    const size_t devCount = ggml_backend_reg_dev_count(reg);
+                    std::vector<std::string> names;
+                    for (size_t i = 0; i < devCount; i++) {
+                        names.push_back(ggml_backend_dev_name(ggml_backend_reg_dev_get(reg, i)));
+                    }
+                    logInfo("rpc: node %s connected, devices %zu\n", endpoint.c_str(), devCount);
+
+                    return [endpoint, names](jsi::Runtime& rt) {
+                        jsi::Object out(rt);
+                        out.setProperty(rt, "endpoint", jsi::String::createFromUtf8(rt, endpoint));
+                        out.setProperty(rt, "count", (double) names.size());
+                        jsi::Array devices(rt, names.size());
+                        for (size_t i = 0; i < names.size(); i++) {
+                            devices.setValueAtIndex(rt, i, jsi::String::createFromUtf8(rt, names[i]));
+                        }
+                        out.setProperty(rt, "devices", devices);
+                        return out;
+                    };
+#else
+                    (void) endpoint;
+                    throw std::runtime_error("rpc: llama.rn was built without GGML_USE_RPC");
+#endif
+                });
+            }
+        );
+        runtime.global().setProperty(runtime, "llamaRpcAddServer", rpcAddServerFn);
+
+        // RPC: raise a node (server side) over the selected devices. start_server blocks
+        // inside accept() for the node's lifetime, so it runs on its own thread; one node
+        // would otherwise occupy a task-pool worker forever.
+        auto rpcStartServerFn = jsi::Function::createFromHostFunction(runtime,
+            jsi::PropNameID::forAscii(runtime, "llamaRpcStartServer"),
+            1,
+            [callInvoker](jsi::Runtime& runtime, const jsi::Value& thisValue, const jsi::Value* arguments, size_t count) -> jsi::Value {
+                const json params = (count > 0 && arguments[0].isObject())
+                    ? toJson(runtime, arguments[0])
+                    : json::object();
+                const std::string endpoint = getPropertyAsString(params, "endpoint");
+                const std::string cacheDir = getPropertyAsString(params, "cacheDir");
+                const int threads = getPropertyAsInt(params, "threads", 0);
+                std::vector<std::string> deviceNames;
+                if (params.contains("devices") && params["devices"].is_array()) {
+                    for (const auto & item : params["devices"]) {
+                        if (item.is_string()) {
+                            deviceNames.push_back(item.get<std::string>());
+                        }
+                    }
+                }
+
+                return createPromiseTask(runtime, callInvoker,
+                    [endpoint, cacheDir, threads, deviceNames]() mutable -> PromiseResultGenerator {
+#if defined(GGML_USE_RPC)
+                    if (endpoint.empty()) {
+                        throw std::runtime_error("rpc: no endpoint given - what should the node listen on?");
+                    }
+                    rpcCheckRpcBackend();
+                    if (threads <= 0) {
+                        // ggml_backend_set_n_threads(backend, 0) would be a node that
+                        // computes nothing: a silent no-op instead of an honest failure.
+                        threads = 1;
+                    }
+                    // One node at a time: a second would take the port and report
+                    // success that does not exist.
+                    bool expected = false;
+                    if (!g_rpc_server_running.compare_exchange_strong(expected, true)) {
+                        throw std::runtime_error("rpc: a node is already running");
+                    }
+
+                    std::vector<ggml_backend_dev_t> devices = rpcResolveDevices(deviceNames);
+                    if (devices.empty()) {
+                        g_rpc_server_running.store(false);
+                        throw std::runtime_error("rpc: none of the given devices is in the registry - nothing to serve from");
+                    }
+
+                    {
+                        std::lock_guard<std::mutex> lock(g_rpc_server_mutex);
+                        if (g_rpc_server_thread.joinable()) {
+                            g_rpc_server_thread.join();
+                        }
+                        g_rpc_server_endpoint = endpoint;
+                        g_rpc_server_cache_dir = cacheDir;
+                        // The thread owns its copy of the device list and outlives the task.
+                        g_rpc_server_thread = std::thread([threads, devices]() mutable {
+                            ggml_backend_rpc_start_server(
+                                g_rpc_server_endpoint.c_str(),
+                                g_rpc_server_cache_dir.empty() ? nullptr : g_rpc_server_cache_dir.c_str(),
+                                (size_t) threads,
+                                devices.size(),
+                                devices.data());
+                        });
+                    }
+
+                    logInfo("rpc: node %s starting, cache %s\n", endpoint.c_str(),
+                        cacheDir.empty() ? "(none)" : cacheDir.c_str());
+
+                    return [endpoint, deviceNames](jsi::Runtime& rt) {
+                        jsi::Object out(rt);
+                        out.setProperty(rt, "endpoint", jsi::String::createFromUtf8(rt, endpoint));
+                        jsi::Array offered(rt, deviceNames.size());
+                        for (size_t i = 0; i < deviceNames.size(); i++) {
+                            offered.setValueAtIndex(rt, i, jsi::String::createFromUtf8(rt, deviceNames[i]));
+                        }
+                        out.setProperty(rt, "devices", offered);
+                        return out;
+                    };
+#else
+                    (void) endpoint;
+                    (void) cacheDir;
+                    (void) threads;
+                    (void) deviceNames;
+                    throw std::runtime_error("rpc: llama.rn was built without GGML_USE_RPC");
+#endif
+                });
+            }
+        );
+        runtime.global().setProperty(runtime, "llamaRpcStartServer", rpcStartServerFn);
 
         // LoRA Adapters
         auto applyLoraAdapters = jsi::Function::createFromHostFunction(runtime,
